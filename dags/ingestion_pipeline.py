@@ -8,6 +8,7 @@ default_args = {
     'owner': 'data-engineer',
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(minutes=30),  # Timeout de 30 minutos por tarefa
 }
 
 def list_and_process_files():
@@ -30,15 +31,39 @@ def list_and_process_files():
         print("Nenhum ficheiro encontrado.")
         return
 
+    # Verificar ficheiros já processados no Silver
+    try:
+        silver_response = s3.list_objects_v2(Bucket='lake-silver')
+        processed_files = set()
+        if 'Contents' in silver_response:
+            for obj in silver_response['Contents']:
+                # Remove .txt e reconstrói o nome original
+                original_name = obj['Key'].replace('.txt', '').replace('_', '.')
+                processed_files.add(original_name)
+    except Exception as e:
+        print(f"Aviso: Não foi possível verificar ficheiros processados: {str(e)}")
+        processed_files = set()
+
+    files_to_process = []
     for obj in response['Contents']:
         file_key = obj['Key']
-        # Processamento simples: processa tudo o que encontrar
-        # (Num cenário real, verificaríamos se já foi processado antes)
+        # Skip ficheiros já processados
+        output_key = file_key.replace('.', '_') + ".txt"
+        if output_key not in [obj['Key'] for obj in silver_response.get('Contents', [])]:
+            files_to_process.append(file_key)
+        else:
+            print(f"Ficheiro {file_key} já processado. A saltar...")
+    
+    print(f"Total de ficheiros a processar: {len(files_to_process)}")
+    
+    for file_key in files_to_process:
         try:
-            process_file('lake-bronze', file_key)
-            print(f"Ficheiro {file_key} processado com sucesso.")
+            result = process_file('lake-bronze', file_key)
+            print(f"Ficheiro {file_key} processado com sucesso. {result}")
         except Exception as e:
             print(f"Erro ao processar {file_key}: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 with DAG(
     '1_ingestao_nao_estruturada',

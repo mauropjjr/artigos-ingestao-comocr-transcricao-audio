@@ -54,23 +54,85 @@ def process_file(bucket_name, file_key):
     return f"Sucesso! Texto guardado em lake-silver/{output_key}"
 
 def _run_ocr(file_path):
-    """Executa OCR em imagens ou PDFs."""
+    """Executa OCR em imagens ou PDFs com otimizações para ficheiros grandes."""
     # Imports lazy para evitar timeout
     import pytesseract
     from pdf2image import convert_from_path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
     
     print("A iniciar OCR...")
+    start_time = time.time()
+    
     # Se for PDF, converte em imagens primeiro
     if file_path.endswith('.pdf'):
-        images = convert_from_path(file_path)
+        # Converter páginas em lotes para economizar memória
+        print("A converter PDF em imagens...")
+        
+        # Processar em lotes de 5 páginas para evitar sobrecarga de memória
         full_text = ""
-        for i, img in enumerate(images):
-            # lang='por' usa o dicionário de Português
-            text = pytesseract.image_to_string(img, lang='por')
-            full_text += f"\n--- Pagina {i+1} ---\n{text}"
+        first_page = 1
+        last_page = None
+        batch_size = 5
+        page_num = 1
+        
+        while True:
+            try:
+                # Converter lote de páginas
+                images = convert_from_path(
+                    file_path,
+                    first_page=first_page,
+                    last_page=first_page + batch_size - 1 if last_page is None else min(first_page + batch_size - 1, last_page),
+                    dpi=150  # Reduzir DPI para acelerar processamento
+                )
+                
+                if not images:
+                    break
+                
+                # Processar páginas do lote
+                for i, img in enumerate(images):
+                    elapsed = time.time() - start_time
+                    print(f"A processar página {page_num}... (tempo decorrido: {elapsed:.1f}s)")
+                    
+                    # lang='por' usa o dicionário de Português
+                    # config para otimizar velocidade
+                    text = pytesseract.image_to_string(
+                        img, 
+                        lang='por',
+                        config='--oem 1 --psm 3'  # OEM 1 = LSTM neural net, PSM 3 = fully automatic page segmentation
+                    )
+                    full_text += f"\n--- Página {page_num} ---\n{text}"
+                    page_num += 1
+                
+                # Avançar para próximo lote
+                first_page += batch_size
+                
+                # Se retornou menos imagens que o batch_size, chegamos ao fim
+                if len(images) < batch_size:
+                    break
+                    
+            except Exception as e:
+                # Fim do PDF ou erro
+                if "Image list must contain at least one image" in str(e):
+                    break
+                print(f"Aviso: Erro ao processar lote começando na página {first_page}: {str(e)}")
+                break
+        
+        total_time = time.time() - start_time
+        print(f"OCR concluído em {total_time:.1f}s. Total de páginas: {page_num - 1}")
         return full_text
     else:
-        return pytesseract.image_to_string(file_path, lang='por')
+        # Para imagens simples
+        from PIL import Image
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(
+            img, 
+            lang='por',
+            config='--oem 1 --psm 3'
+        )
+        elapsed = time.time() - start_time
+        print(f"OCR concluído em {elapsed:.1f}s")
+        return text
 
 def _run_transcription(file_path):
     """Executa transcrição de áudio usando Whisper."""
