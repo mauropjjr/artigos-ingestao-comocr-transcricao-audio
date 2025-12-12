@@ -1,0 +1,226 @@
+# Arquitetura do Sistema
+
+## Visão Geral
+
+Este sistema implementa um pipeline de ingestão de dados não estruturados para alimentar sistemas de IA Generativa. A arquitetura segue o padrão **Medallion Architecture** (Bronze → Silver → Gold) comumente usado em Data Lakes modernos.
+
+## Camadas do Data Lake
+
+### 🥉 Bronze (Raw/Landing Zone)
+- **Propósito**: Armazenamento bruto de ficheiros recém-chegados
+- **Formatos**: PDF, imagens (JPG, PNG), áudio (MP3, WAV, M4A)
+- **Características**:
+  - Dados imutáveis (append-only)
+  - Sem transformações aplicadas
+  - Retenção de metadados originais
+
+### 🥈 Silver (Processed/Cleaned Zone)
+- **Propósito**: Dados transformados e limpos
+- **Formato**: Texto puro (UTF-8)
+- **Transformações Aplicadas**:
+  - OCR (Tesseract) para documentos visuais
+  - Transcrição (Whisper) para áudio
+  - Limpeza básica de caracteres especiais
+- **Características**:
+  - Dados estruturados em texto
+  - Indexados por timestamp
+  - Prontos para vetorização
+
+### 🥇 Gold (Analytics/Serving Zone)
+- **Propósito**: Dados otimizados para consumo (próxima fase)
+- **Formato**: Vetores de embedding + metadados
+- **Uso**: Busca semântica, RAG, Agentes de IA
+
+## Componentes Técnicos
+
+### Apache Airflow
+```
+┌─────────────────────────────────────┐
+│          Airflow Scheduler          │
+│  - Monitora DAGs                    │
+│  - Executa tarefas a cada 30 min    │
+│  - Gerencia dependências            │
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│       Airflow Webserver (UI)        │
+│  - Dashboard de monitorização       │
+│  - Logs e troubleshooting           │
+│  - Controlo manual de execuções     │
+└─────────────────────────────────────┘
+```
+
+### MinIO (S3-Compatible Storage)
+```
+┌─────────────────────────────────────┐
+│            MinIO Server             │
+│                                     │
+│  ┌─────────┐  ┌─────────┐  ┌─────┐│
+│  │ Bronze  │  │ Silver  │  │Gold ││
+│  │ Bucket  │→ │ Bucket  │→ │Bkt  ││
+│  └─────────┘  └─────────┘  └─────┘│
+│                                     │
+│  API (S3): :9000                    │
+│  Console:  :9001                    │
+└─────────────────────────────────────┘
+```
+
+### Pipeline de Processamento
+
+```
+                 ┌──────────────────┐
+     Upload      │  lake-bronze/    │
+  ─────────────→ │  documento.pdf   │
+   (MinIO UI)    └────────┬─────────┘
+                          │
+                ┌─────────▼──────────┐
+                │  Airflow Sensor    │
+                │  (detecta novos)   │
+                └─────────┬──────────┘
+                          │
+              ┌───────────▼────────────┐
+              │  ingestion_brain.py    │
+              │                        │
+              │  ┌──────────────────┐  │
+              │  │ Identificador de │  │
+              │  │ Tipo de Ficheiro │  │
+              │  └────────┬─────────┘  │
+              │           │            │
+              │    ┌──────▼──────┐     │
+              │    │  Roteador   │     │
+              │    └──┬──────┬───┘     │
+              └───────┼──────┼─────────┘
+                      │      │
+         ┌────────────┘      └────────────┐
+         │                                │
+    ┌────▼─────┐                   ┌─────▼─────┐
+    │Tesseract │                   │  Whisper  │
+    │   OCR    │                   │    STT    │
+    └────┬─────┘                   └─────┬─────┘
+         │                                │
+         └────────────┬────────────────────┘
+                      │
+              ┌───────▼────────┐
+              │  lake-silver/  │
+              │  documento.txt │
+              └────────────────┘
+```
+
+## Fluxo de Dados Detalhado
+
+### 1. Detecção de Ficheiros
+```python
+# ingestion_pipeline.py - list_and_process_files()
+response = s3.list_objects_v2(Bucket='lake-bronze')
+for obj in response['Contents']:
+    process_file('lake-bronze', obj['Key'])
+```
+
+### 2. Decisão de Processamento
+```python
+# ingestion_brain.py - process_file()
+file_ext = local_path.split('.')[-1].lower()
+
+if file_ext in ['pdf', 'png', 'jpg']:
+    extracted_text = _run_ocr(local_path)
+elif file_ext in ['mp3', 'wav', 'm4a']:
+    extracted_text = _run_transcription(local_path)
+```
+
+### 3. Extração de Texto
+
+#### OCR (Tesseract)
+```
+PDF → pdf2image → PIL Image → Tesseract → Texto
+```
+
+#### Transcrição (Whisper)
+```
+Áudio → FFmpeg → Mel Spectrogram → Whisper Neural Net → Texto
+```
+
+### 4. Persistência
+```python
+s3_client.put_object(
+    Bucket='lake-silver',
+    Key=output_key,
+    Body=extracted_text.encode('utf-8')
+)
+```
+
+## Escalabilidade
+
+### Horizontal
+- **Airflow Workers**: Adicionar múltiplos workers para processamento paralelo
+- **MinIO Cluster**: Distribuir armazenamento em múltiplos nós
+
+### Vertical
+- **GPU para Whisper**: Usar modelo `large` com CUDA
+- **Mais RAM**: Processar ficheiros maiores sem swap
+
+### Otimizações Futuras
+1. **Processamento em Stream**: Para ficheiros muito grandes
+2. **Cache de Modelos**: Manter Whisper em memória entre execuções
+3. **Particionamento**: Dividir processamento por tipo de ficheiro
+4. **Dead Letter Queue**: Para ficheiros que falharam processamento
+
+## Segurança
+
+### Camada de Rede
+```
+Internet → Firewall → Reverse Proxy (Nginx) → Airflow/MinIO
+                              ↓
+                            TLS/SSL
+```
+
+### Controlo de Acesso
+- **MinIO**: IAM Policies (S3-compatible)
+- **Airflow**: RBAC (Role-Based Access Control)
+- **PostgreSQL**: Credenciais encriptadas
+
+### Auditoria
+- Logs de acesso ao MinIO
+- Logs de execução do Airflow
+- Tracking de modificações de ficheiros
+
+## Monitorização
+
+### Métricas-Chave
+- **Latência de Processamento**: Tempo entre upload e texto extraído
+- **Taxa de Erro**: % de ficheiros que falharam processamento
+- **Throughput**: Ficheiros processados por hora
+- **Utilização de Recursos**: CPU, RAM, Disco
+
+### Alertas Recomendados
+- ⚠️ Fila de ficheiros > 100 (possível bottleneck)
+- ⚠️ Taxa de erro > 5%
+- ⚠️ Disco MinIO > 80% de utilização
+- ⚠️ Airflow scheduler não executa há > 10 min
+
+## Comparação com Alternativas
+
+| Componente | Escolhido | Alternativa | Motivo da Escolha |
+|------------|-----------|-------------|-------------------|
+| Orquestração | Airflow | Prefect, Dagster | Maturidade, comunidade |
+| Armazenamento | MinIO | AWS S3, Azure Blob | Custo, privacidade local |
+| OCR | Tesseract | AWS Textract | Open-source, sem custos API |
+| Transcrição | Whisper | Google Speech-to-Text | Qualidade PT-BR, offline |
+| Base de Dados | PostgreSQL | MySQL, MongoDB | Suporte nativo Airflow |
+
+## Próximas Evoluções
+
+### Fase 2: Vetorização
+- Implementar embeddings com Sentence Transformers
+- Indexar no Pinecone/Qdrant
+- API de busca semântica
+
+### Fase 3: Agente de IA
+- Integração com LangChain
+- Implementação de RAG
+- Interface conversacional
+
+### Fase 4: Automação Completa
+- Processamento em tempo real (Event-Driven)
+- Auto-scaling baseado em carga
+- MLOps para retreinamento de modelos
